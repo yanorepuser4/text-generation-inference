@@ -22,11 +22,6 @@ from text_generation_server.models.types import (
     Generation,
     GeneratedText,
 )
-from text_generation_server.models.cache_manager import (
-    get_cache_manager,
-    set_cache_manager,
-    BLOCK_SIZE,
-)
 from text_generation_server.pb import generate_pb2
 from text_generation_server.models.globals import MEM_POOL, CUDA_GRAPHS
 from text_generation_server.utils import StoppingCriteria, HeterogeneousNextTokenChooser
@@ -39,6 +34,21 @@ from text_generation_server.utils.import_utils import (
     IS_XPU_SYSTEM,
 )
 
+BLOCK_SIZE: int = 16
+
+# Will be set in init
+SLIDING_WINDOW: Optional[int] = None
+
+
+def set_sliding_window(sliding_window: int):
+    global SLIDING_WINDOW
+    SLIDING_WINDOW = sliding_window
+
+
+def get_sliding_windows() -> int:
+    global SLIDING_WINDOW
+    return SLIDING_WINDOW
+
 
 @dataclass
 class FlashCausalLMBatch(Batch):
@@ -50,12 +60,15 @@ class FlashCausalLMBatch(Batch):
     # Decoder values
     input_ids: torch.Tensor
     position_ids: torch.Tensor
-    speculative_ids: torch.Tensor
+    speculative_ids: Optional[torch.Tensor]
 
     # Flash Attention values
 
     # tensor of length b containing the cumulative sequence lengths of the sequences in the batch, only used in prefill
     cu_seqlen_prefill: Optional[torch.Tensor]
+    # Prefill cache indices is used to slice into the kv tensor before caching it into the paged attention buffers
+    # as we only keep SLIDING_WINDOW values instead of the whole tensor
+    prefill_cache_indices: Optional[torch.Tensor]
 
     # Paged Attention values
 
@@ -123,18 +136,20 @@ class FlashCausalLMBatch(Batch):
         return batch_tokenized_inputs
 
     @classmethod
-    def from_pb(
+    def from_tokenized(
         cls,
         pb: generate_pb2.Batch,
         tokenizer: PreTrainedTokenizerBase,
+        batch_tokenized_inputs,
         dtype: torch.dtype,
         device: torch.device,
     ) -> "FlashCausalLMBatch":
-        batch_tokenized_inputs = cls.batch_tokenized_inputs(pb.requests, tokenizer)
+        sliding_window = get_sliding_windows()
         position_ids = []
         cu_seqlen_prefill = [0]
         start_slots = []
         slot_indices = []
+        prefill_cache_indices = []
 
         input_lengths = []
         prefix_offsets = []
@@ -212,8 +227,15 @@ class FlashCausalLMBatch(Batch):
             # blocks and slots can be empty (for example in warmup)
             if not r.blocks:
                 needed_blocks = math.ceil(total_tokens / BLOCK_SIZE)
-                request_blocks = [b for b in range(cumulative_blocks, cumulative_blocks + needed_blocks)]
-                request_slots = [s for b in request_blocks for s in range(b * BLOCK_SIZE, (b + 1) * BLOCK_SIZE)]
+                request_blocks = [
+                    b
+                    for b in range(cumulative_blocks, cumulative_blocks + needed_blocks)
+                ]
+                request_slots = [
+                    s
+                    for b in request_blocks
+                    for s in range(b * BLOCK_SIZE, (b + 1) * BLOCK_SIZE)
+                ]
                 cumulative_blocks += needed_blocks
             else:
                 request_blocks = r.blocks
@@ -230,6 +252,15 @@ class FlashCausalLMBatch(Batch):
                 dtype=torch.int64,
             )
             slot_indices.append(request_slot_indices)
+
+            # Create tensor to slice into the kv tensor in prefill
+            if sliding_window is not None:
+                request_prefill_cache_indices = torch.arange(
+                    cumulative_length + max(0, input_length - sliding_window),
+                    cumulative_length + input_length,
+                    dtype=torch.int64,
+                )
+                prefill_cache_indices.append(request_prefill_cache_indices)
 
             all_prefill_logprobs = all_prefill_logprobs and r.prefill_logprobs
             no_prefill_logprobs = no_prefill_logprobs and not r.prefill_logprobs
@@ -281,16 +312,23 @@ class FlashCausalLMBatch(Batch):
             input_ids = np.concatenate(all_input_ids, dtype=np.int64)
             position_ids = torch.cat(position_ids)
             slot_indices = torch.cat(slot_indices)
+            if sliding_window is not None:
+                prefill_cache_indices = torch.cat(prefill_cache_indices)
         else:
             input_ids = all_input_ids[0]
             position_ids = position_ids[0]
             slot_indices = slot_indices[0]
+            if sliding_window is not None:
+                prefill_cache_indices = prefill_cache_indices[0]
 
         cu_seqlen_prefill = torch.tensor(
             cu_seqlen_prefill, device=device, dtype=torch.int32
         )
         position_ids = position_ids.to(device)
         slot_indices = slot_indices.to(device)
+        prefill_cache_indices = (
+            prefill_cache_indices.to(device) if sliding_window is not None else None
+        )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, device=device)
         input_lengths_tensor = torch.tensor(
             input_lengths, dtype=torch.int32, device=device
@@ -314,9 +352,11 @@ class FlashCausalLMBatch(Batch):
         )
 
         slots = torch.tensor(slots, dtype=torch.int64, device=device)
-        block_tables_tensor = torch.zeros((len(block_tables), max_blocks), dtype=torch.int64, device="cpu")
+        block_tables_tensor = torch.zeros(
+            (len(block_tables), max_blocks), dtype=torch.int64, device="cpu"
+        )
         for i, request_blocks in enumerate(block_tables):
-            block_tables_tensor[i, :len(request_blocks)] = torch.tensor(request_blocks)
+            block_tables_tensor[i, : len(request_blocks)] = torch.tensor(request_blocks)
         block_tables_tensor = block_tables_tensor.to(device)
 
         return cls(
@@ -326,6 +366,7 @@ class FlashCausalLMBatch(Batch):
             input_ids=input_ids,
             position_ids=position_ids,
             cu_seqlen_prefill=cu_seqlen_prefill,
+            prefill_cache_indices=prefill_cache_indices,
             start_slots=start_slots,
             slot_indices=slot_indices,
             block_tables=block_tables,
@@ -349,6 +390,17 @@ class FlashCausalLMBatch(Batch):
             max_blocks=max_blocks,
             speculative_ids=None,
         )
+
+    @classmethod
+    def from_pb(
+        cls,
+        pb: generate_pb2.Batch,
+        tokenizer: PreTrainedTokenizerBase,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> "FlashCausalLMBatch":
+        batch_tokenized_inputs = cls.batch_tokenized_inputs(pb.requests, tokenizer)
+        return cls.from_tokenized(pb, tokenizer, batch_tokenized_inputs, dtype, device)
 
     @tracer.start_as_current_span("filter")
     def filter(self, request_ids: List[int]) -> "FlashCausalLMBatch":
@@ -463,6 +515,7 @@ class FlashCausalLMBatch(Batch):
             input_ids=input_ids,
             position_ids=position_ids,
             cu_seqlen_prefill=None,
+            prefill_cache_indices=None,
             start_slots=start_slots,
             slot_indices=slot_indices,
             block_tables=block_tables,
@@ -629,6 +682,7 @@ class FlashCausalLMBatch(Batch):
             input_ids=input_ids,
             position_ids=position_ids,
             cu_seqlen_prefill=None,
+            prefill_cache_indices=None,
             start_slots=start_slots,
             slot_indices=slot_indices,
             block_tables=block_tables,
@@ -676,6 +730,7 @@ class FlashCausalLM(Model):
         self.head_size = head_size
 
         self.cuda_graphs = {}
+        self.kv_cache = []
 
         super(FlashCausalLM, self).__init__(
             model=model,
@@ -692,6 +747,44 @@ class FlashCausalLM(Model):
     def batch_type(self) -> Type[FlashCausalLMBatch]:
         return FlashCausalLMBatch
 
+    def max_past(self) -> int:
+        return getattr(self.model, "max_past", None)
+
+    def init_kv_cache(
+        self,
+        num_blocks: int,
+        num_layers: int,
+        num_heads: int,
+        head_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.kv_cache = []
+        if IS_CUDA_SYSTEM:
+            torch.cuda.empty_cache()
+
+        element_size = torch.tensor([], dtype=dtype).element_size()
+        if IS_XPU_SYSTEM:
+            x = 1
+        else:
+            x = BLOCK_SIZE // element_size
+
+        self.kv_cache = [
+            (
+                torch.empty(
+                    (num_blocks, num_heads, head_size // x, BLOCK_SIZE, x),
+                    dtype=dtype,
+                    device=device,
+                ),
+                torch.empty(
+                    (num_blocks, num_heads, head_size, BLOCK_SIZE),
+                    dtype=dtype,
+                    device=device,
+                ),
+            )
+            for _ in range(num_layers)
+        ]
+
     def cuda_graph_warmup(self, bs: int, max_s: int, max_bt: int):
         input_ids = torch.zeros(bs, dtype=torch.int64, device=self.device)
         position_ids = torch.zeros(bs, dtype=torch.int32, device=self.device)
@@ -702,12 +795,11 @@ class FlashCausalLM(Model):
             .repeat(bs)
             .reshape((bs, max_bt))
         )
-        kv_cache = get_cache_manager().kv_cache
 
         self.cuda_graphs[bs] = {
             "input_ids": input_ids,
             "position_ids": position_ids,
-            "kv_cache": kv_cache,
+            "kv_cache": self.kv_cache,
             "block_tables": block_tables,
             "slots": slots,
             "input_lengths": input_lengths,
@@ -721,11 +813,12 @@ class FlashCausalLM(Model):
             input_ids=input_ids,
             position_ids=position_ids,
             cu_seqlen_prefill=None,
-            kv_cache=kv_cache,
+            kv_cache=self.kv_cache,
             block_tables=block_tables,
             slots=slots,
             input_lengths=input_lengths,
             max_s=max_s,
+            prefill_cache_indices=None,
             lm_head_indices=None,
         )
         torch.cuda.synchronize()
@@ -735,11 +828,12 @@ class FlashCausalLM(Model):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 cu_seqlen_prefill=None,
-                kv_cache=kv_cache,
+                kv_cache=self.kv_cache,
                 block_tables=block_tables,
                 slots=slots,
                 input_lengths=input_lengths,
                 max_s=max_s,
+                prefill_cache_indices=None,
                 lm_head_indices=None,
             )
             self.cuda_graphs[bs]["logits"] = logits
@@ -753,17 +847,16 @@ class FlashCausalLM(Model):
         elif IS_XPU_SYSTEM:
             torch.xpu.empty_cache()
         try:
-            cache_manager = set_cache_manager(
+            self.init_kv_cache(
                 batch.blocks,
                 self.num_layers,
                 self.num_kv_heads,
                 self.head_size,
-                self.sliding_window is not None,
                 self.dtype,
                 self.device,
             )
             max_bt = batch.max_blocks
-            max_s = max_bt * get_cache_manager().block_size
+            max_s = max_bt * BLOCK_SIZE
             _, batch, _ = self.generate_token(batch)
         except torch.cuda.OutOfMemoryError as e:
             raise RuntimeError(
@@ -801,18 +894,16 @@ class FlashCausalLM(Model):
             # Leave 5% for some wiggle room
             int((free_memory * 0.95) // total_cache_size)
             # Add batch.blocks as we allocated it above, so it is included in the peak memory.
-            + cache_manager.num_blocks
+            + batch.blocks
         )
 
         del batch
-        del cache_manager
 
-        set_cache_manager(
+        self.init_kv_cache(
             num_blocks,
             self.num_layers,
             self.num_kv_heads,
             self.head_size,
-            self.sliding_window is not None,
             self.dtype,
             self.device,
         )
@@ -839,7 +930,7 @@ class FlashCausalLM(Model):
             input_ids = batch.input_ids
             position_ids = batch.position_ids
             cu_seqlen_prefill = batch.cu_seqlen_prefill
-            kv_cache = get_cache_manager().kv_cache
+            kv_cache = self.kv_cache
             block_tables = batch.block_tables_tensor
             slots = batch.slots[batch.slot_indices]
             input_lengths = batch.input_lengths_tensor
@@ -878,12 +969,18 @@ class FlashCausalLM(Model):
             input_ids = batch.input_ids
             position_ids = batch.position_ids
             cu_seqlen_prefill = batch.cu_seqlen_prefill
-            kv_cache = get_cache_manager().kv_cache
+            kv_cache = self.kv_cache
             block_tables = batch.block_tables_tensor
             slots = batch.slots[batch.slot_indices]
             input_lengths = batch.input_lengths_tensor
             max_s = batch.max_seqlen
             lm_head_indices = batch.prefill_head_indices
+
+        if cu_seqlen_prefill is None and self.max_past() is not None:
+            # In decode, not prefill, we're actually overwriting the KV-cache
+            # in a circular buffer mode.
+            # This makes sure the max_s for the decode pass is correct.
+            max_s = min(self.max_past(), max_s)
 
         bs = input_ids.shape[0]
         sorted_padded_bs = sorted([k for k in self.cuda_graphs.keys() if k >= bs])
@@ -894,7 +991,7 @@ class FlashCausalLM(Model):
             cuda_graph = None
 
         if cu_seqlen_prefill is not None or cuda_graph is None:
-            return self.model.forward(
+            logits, speculative_logits = self.model.forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 cu_seqlen_prefill=cu_seqlen_prefill,
@@ -903,8 +1000,12 @@ class FlashCausalLM(Model):
                 slots=slots,
                 input_lengths=input_lengths,
                 max_s=max_s,
+                prefill_cache_indices=batch.prefill_cache_indices,
                 lm_head_indices=lm_head_indices,
             )
+            if batch.prefill_cache_indices is not None:
+                batch.prefill_cache_indices = None
+            return logits, speculative_logits
 
         # Copy inputs to the static inputs of the cuda graph
         # Static inputs are potentially padded
