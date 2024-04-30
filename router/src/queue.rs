@@ -1,13 +1,14 @@
+use std::cmp::max;
 use crate::infer::InferError;
 use crate::infer::InferStreamResponse;
 use crate::validation::ValidGenerateRequest;
 use nohash_hasher::{BuildNoHashHasher, IntMap};
-use std::cmp::min;
 use std::collections::VecDeque;
 use text_generation_client::{Batch, Request};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{info_span, instrument, Span};
+use crate::block_allocator::{BlockAllocation, BlockAllocator};
 
 /// Queue entry
 #[derive(Debug)]
@@ -24,6 +25,8 @@ pub(crate) struct Entry {
     pub queue_time: Instant,
     /// Instant when this entry was added to a batch
     pub batch_time: Option<Instant>,
+    /// Block Allocation
+    pub block_allocation: Option<BlockAllocation>,
 }
 
 /// Request Queue
@@ -39,6 +42,7 @@ impl Queue {
         block_size: u32,
         window_size: Option<u32>,
         speculate: u32,
+        max_batch_total_tokens: u32,
     ) -> Self {
         // Create channel
         let (queue_sender, queue_receiver) = mpsc::unbounded_channel();
@@ -49,6 +53,7 @@ impl Queue {
             block_size,
             window_size,
             speculate,
+            max_batch_total_tokens,
             queue_receiver,
         ));
 
@@ -100,9 +105,16 @@ async fn queue_task(
     block_size: u32,
     window_size: Option<u32>,
     speculate: u32,
+    max_batch_total_tokens: u32,
     mut receiver: mpsc::UnboundedReceiver<QueueCommand>,
 ) {
-    let mut state = State::new(requires_padding, block_size, window_size, speculate);
+    let mut state = State::new(
+        requires_padding,
+        block_size,
+        window_size,
+        speculate,
+        max_batch_total_tokens,
+    );
 
     while let Some(cmd) = receiver.recv().await {
         match cmd {
@@ -117,12 +129,13 @@ async fn queue_task(
                 token_budget,
                 response_sender,
                 span,
-            } => span.in_scope(|| {
+            } => {
+                let _parent_span = span.enter();
                 let next_batch =
-                    state.next_batch(min_size, max_size, prefill_token_budget, token_budget);
+                    state.next_batch(min_size, max_size, prefill_token_budget, token_budget).await;
                 response_sender.send(next_batch).unwrap();
                 metrics::gauge!("tgi_queue_size", state.entries.len() as f64);
-            }),
+            },
         }
     }
 }
@@ -139,17 +152,14 @@ struct State {
     /// Id of the next batch
     next_batch_id: u64,
 
-    /// Whether the model is using padding
-    requires_padding: bool,
-
     /// Paged Attention block size
     block_size: u32,
 
-    /// Sliding window
-    window_size: Option<u32>,
-
     /// Speculation amount
     speculate: u32,
+
+    /// Paged Attention Block Allocation
+    block_allocator: Option<BlockAllocator>,
 }
 
 impl State {
@@ -158,15 +168,20 @@ impl State {
         block_size: u32,
         window_size: Option<u32>,
         speculate: u32,
+        max_batch_total_tokens: u32,
     ) -> Self {
+        let block_allocator = match requires_padding {
+            true => None,
+            false => Some(BlockAllocator::new(max_batch_total_tokens, block_size, window_size))
+        };
+
         Self {
             entries: VecDeque::with_capacity(128),
             next_id: 0,
             next_batch_id: 0,
-            requires_padding,
             block_size,
-            window_size,
             speculate,
+            block_allocator,
         }
     }
 
@@ -182,7 +197,7 @@ impl State {
     }
 
     // Get the next batch
-    fn next_batch(
+    async fn next_batch(
         &mut self,
         min_size: Option<usize>,
         max_size: Option<usize>,
@@ -217,9 +232,10 @@ impl State {
         let mut max_input_length = 0;
         let mut prefill_tokens: u32 = 0;
         let mut decode_tokens: u32 = 0;
+        let mut max_blocks = 0;
 
         // Pop entries starting from the front of the queue
-        while let Some((id, mut entry)) = self.entries.pop_front() {
+        'entry_loop: while let Some((id, mut entry)) = self.entries.pop_front() {
             // Filter entries where the response receiver was dropped (== entries where the request
             // was dropped by the client)
             if entry.response_tx.is_closed() {
@@ -228,43 +244,43 @@ impl State {
                 continue;
             }
 
-            if self.requires_padding {
-                // We pad to max input length in the Python shards
-                // We need to take these padding tokens into the equation
-                max_input_length = max_input_length.max(entry.request.input_length);
-                prefill_tokens = (batch_requests.len() + 1) as u32 * max_input_length
-            } else {
-                // pad to block size
-                prefill_tokens += ((entry.request.input_length + self.block_size - 1)
-                    / self.block_size)
-                    * self.block_size;
-            }
+            let block_allocation = match &self.block_allocator {
+                None => {
+                    // We pad to max input length in the Python shards
+                    // We need to take these padding tokens into the equation
+                    max_input_length = max_input_length.max(entry.request.input_length);
+                    prefill_tokens = (batch_requests.len() + 1) as u32 * max_input_length;
 
-            if self.requires_padding {
-                decode_tokens += entry.request.stopping_parameters.max_new_tokens;
-            } else {
-                let max_new_tokens = match self.window_size {
-                    None => entry.request.stopping_parameters.max_new_tokens,
-                    Some(window_size) => min(
-                        window_size.saturating_sub(entry.request.input_length),
-                        entry.request.stopping_parameters.max_new_tokens,
-                    ),
-                };
+                    decode_tokens += entry.request.stopping_parameters.max_new_tokens;
+                    let total_tokens = prefill_tokens + decode_tokens + self.speculate;
 
-                // pad to block size
-                decode_tokens +=
-                    ((max_new_tokens + self.block_size - 1) / self.block_size) * self.block_size;
-            }
+                    if prefill_tokens > prefill_token_budget || total_tokens > token_budget {
+                        // Entry is over budget
+                        // Add it back to the front
+                        tracing::debug!("Over budget: prefill_tokens={prefill_tokens} > {prefill_token_budget} || {prefill_tokens} + {decode_tokens} + {} > {token_budget}", self.speculate);
+                        self.entries.push_front((id, entry));
+                        break 'entry_loop;
+                    }
+                    None
+                }
+                Some(block_allocator) => {
+                    let tokens = entry.request.input_length + entry.request.stopping_parameters.max_new_tokens;
 
-            if prefill_tokens > prefill_token_budget
-                || (prefill_tokens + decode_tokens + self.speculate) > token_budget
-            {
-                // Entry is over budget
-                // Add it back to the front
-                tracing::debug!("Over budget: prefill_tokens={prefill_tokens} > {prefill_token_budget} || {prefill_tokens} + {decode_tokens} + {} > {token_budget}", self.speculate);
-                self.entries.push_front((id, entry));
-                break;
-            }
+                    match block_allocator.allocate(tokens).await {
+                        None => {
+                            // Entry is over budget
+                            // Add it back to the front
+                            tracing::debug!("Over budget: not enough free blocks");
+                            self.entries.push_front((id, entry));
+                            break 'entry_loop;
+                        }
+                        Some(block_allocation) => {
+                            max_blocks = max(max_blocks, block_allocation.blocks.len() as u32);
+                            Some(block_allocation)
+                        }
+                    }
+                }
+            };
 
             tracing::debug!("Accepting entry");
             // Create a new span to link the batch back to this entry
@@ -275,6 +291,13 @@ impl State {
             // Update entry
             entry.temp_span = Some(entry_batch_span);
 
+            let (blocks, slots) = match &block_allocation {
+                None => (Vec::new(), Vec::new()),
+                Some(block_allocation) => (block_allocation.blocks.clone(), block_allocation.slots.clone())
+            };
+
+            entry.block_allocation = block_allocation;
+
             batch_requests.push(Request {
                 id,
                 prefill_logprobs: entry.request.decoder_input_details,
@@ -283,6 +306,8 @@ impl State {
                 parameters: Some(entry.request.parameters.clone()),
                 stopping_parameters: Some(entry.request.stopping_parameters.clone()),
                 top_n_tokens: entry.request.top_n_tokens,
+                blocks,
+                slots,
             });
             // Set batch_time
             entry.batch_time = Some(Instant::now());
@@ -325,6 +350,7 @@ impl State {
             requests: batch_requests,
             size,
             max_tokens: (prefill_tokens + decode_tokens),
+            max_blocks
         };
         // Increment batch id
         self.next_batch_id += 1;

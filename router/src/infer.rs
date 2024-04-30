@@ -69,7 +69,13 @@ impl Infer {
         tokenizer_config: HubTokenizerConfig,
     ) -> Self {
         // Infer shared state
-        let queue = Queue::new(requires_padding, 16, window_size, speculate);
+        let queue = Queue::new(
+            requires_padding,
+            16,
+            window_size,
+            speculate,
+            max_batch_total_tokens,
+        );
         let shared = Arc::new(Shared {
             batching_task: Notify::new(),
         });
@@ -150,6 +156,7 @@ impl Infer {
             temp_span: None,
             queue_time: Instant::now(),
             batch_time: None,
+            block_allocation: None,
         });
 
         // Notify the background task that we have a new entry in the queue that needs

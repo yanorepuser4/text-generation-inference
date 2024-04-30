@@ -55,12 +55,16 @@ impl Health {
                     ignore_eos_token: false,
                 }),
                 top_n_tokens: 0,
+                // Block 0 is reserved for health checks
+                blocks: vec![0],
+                slots: (0..16).collect(),
             };
             let batch = Batch {
                 id: BATCH_ID,
                 requests: vec![liveness_request],
                 size: 1,
                 max_tokens: 2,
+                max_blocks: 1,
             };
             // Skips the queue
             let value = self.client.prefill(batch).await.is_ok();

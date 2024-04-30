@@ -5,6 +5,7 @@ mod infer;
 mod queue;
 pub mod server;
 mod validation;
+mod block_allocator;
 
 use infer::{Infer, InferError, InferStreamResponse};
 use queue::{Entry, Queue};
