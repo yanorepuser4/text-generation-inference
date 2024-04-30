@@ -37,28 +37,52 @@ impl BlockAllocator {
             receiver,
         ));
 
-        Self { block_allocator: sender }
+        Self {
+            block_allocator: sender,
+        }
     }
 
     pub(crate) async fn allocate(&self, tokens: u32) -> Option<BlockAllocation> {
         let (response_sender, response_receiver) = oneshot::channel();
-        self.block_allocator.send(BlockAllocatorCommand::Allocate { tokens, response_sender }).unwrap();
+        self.block_allocator
+            .send(BlockAllocatorCommand::Allocate {
+                tokens,
+                response_sender,
+            })
+            .unwrap();
 
-        response_receiver.await.unwrap().map(|(blocks, slots)| BlockAllocation { blocks, slots, block_allocator: self.clone() })
+        response_receiver
+            .await
+            .unwrap()
+            .map(|(blocks, slots)| BlockAllocation {
+                blocks,
+                slots,
+                block_allocator: self.clone(),
+            })
     }
 
     pub(crate) fn free(&self, blocks: Vec<u32>) {
-        self.block_allocator.send(BlockAllocatorCommand::Free { blocks }).unwrap();
+        self.block_allocator
+            .send(BlockAllocatorCommand::Free { blocks })
+            .unwrap();
     }
 }
 
-async fn block_allocator_task(blocks: u32, block_size: u32, window_size: Option<u32>, mut receiver: mpsc::UnboundedReceiver<BlockAllocatorCommand>) {
+async fn block_allocator_task(
+    blocks: u32,
+    block_size: u32,
+    window_size: Option<u32>,
+    mut receiver: mpsc::UnboundedReceiver<BlockAllocatorCommand>,
+) {
     // Block 0 is reserved for health checks
     let mut free_blocks: Vec<u32> = (1..blocks).collect();
     while let Some(cmd) = receiver.recv().await {
         match cmd {
             BlockAllocatorCommand::Free { blocks } => free_blocks.extend(blocks),
-            BlockAllocatorCommand::Allocate { tokens, response_sender } => {
+            BlockAllocatorCommand::Allocate {
+                tokens,
+                response_sender,
+            } => {
                 // Apply window size
                 let (tokens, repeats) = match window_size {
                     None => (tokens, 1),
@@ -80,7 +104,7 @@ async fn block_allocator_task(blocks: u32, block_size: u32, window_size: Option<
                     for _ in 0..required_blocks {
                         let block_id = free_blocks.pop().unwrap();
                         blocks.push(block_id);
-                        for s in (block_id * block_size)..((block_id+1) * block_size) {
+                        for s in (block_id * block_size)..((block_id + 1) * block_size) {
                             slots.push(s);
                         }
                     }
@@ -92,11 +116,10 @@ async fn block_allocator_task(blocks: u32, block_size: u32, window_size: Option<
     }
 }
 
-
 #[derive(Debug)]
 enum BlockAllocatorCommand {
     Free {
-        blocks: Vec<u32>
+        blocks: Vec<u32>,
     },
     Allocate {
         tokens: u32,
