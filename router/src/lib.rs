@@ -15,6 +15,23 @@ use tracing::warn;
 use utoipa::ToSchema;
 use validation::Validation;
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LiveReponse {
+    pub live: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReadyResponse {
+    pub live: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MetadataServerResponse {
+    pub name: String,
+    pub version: String,
+    pub extensions: Vec<String>,
+}
+
 /// Type alias for generation responses
 pub(crate) type GenerateStreamResponse = (
     OwnedSemaphorePermit,
