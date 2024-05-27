@@ -2,6 +2,11 @@ use crate::config::Config;
 /// HTTP Server logic
 use crate::health::Health;
 use crate::infer::{InferError, InferResponse, InferStreamResponse, ToolGrammar};
+#[cfg(feature = "kserve")]
+use crate::kserve::{
+    InferenceOutput, InferenceRequest, LiveReponse, MetadataServerResponse, OutputChunk,
+    ReadyResponse,
+};
 use crate::validation::ValidationError;
 use crate::{
     BestOfSequence, Details, ErrorResponse, FinishReason, GenerateParameters, GenerateRequest,
@@ -16,11 +21,6 @@ use crate::{
     CompletionRequest, DeltaToolCall, Function, Tool, VertexRequest, VertexResponse,
 };
 use crate::{FunctionDefinition, ToolCall, ToolType};
-#[cfg(feature = "kserve")]
-use crate::{
-    InferenceOutput, InferenceRequest, LiveReponse, MetadataServerResponse, OutputChunk,
-    ReadyResponse,
-};
 use async_stream::__private::AsyncStream;
 use axum::extract::Extension;
 #[cfg(feature = "kserve")]
@@ -1365,13 +1365,12 @@ async fn metrics(prom_handle: Extension<PrometheusHandle>) -> String {
     tag = "Text Generation Inference",
     path = "/v2/health/live",
     responses(
-    (status = 200, description = "Live response", body = LiveReponse),
-    (status = 404, description = "No response", body = ErrorResponse,
-    example = json ! ({"error": "No response"})),
+        (status = 200, description = "Service is live", body = LiveReponse),
+        (status = 404, description = "Service not found", body = ErrorResponse,
+            example = json!({"error": "No response"}))
     )
-    )]
-// https://github.com/kserve/open-inference-protocol/blob/main/specification/protocol/inference_rest.md
-async fn get_v2_health_live() -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+)]
+async fn kserve_health_live() -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let data = LiveReponse { live: true };
     Ok((HeaderMap::new(), Json(data)).into_response())
 }
@@ -1382,12 +1381,12 @@ async fn get_v2_health_live() -> Result<Response, (StatusCode, Json<ErrorRespons
     tag = "Text Generation Inference",
     path = "/v2/health/ready",
     responses(
-    (status = 200, description = "Ready response", body = ReadyResponse),
-    (status = 404, description = "No response", body = ErrorResponse,
-    example = json ! ({"error": "No response"})),
+        (status = 200, description = "Service is ready", body = ReadyResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse,
+            example = json!({"error": "No response"}))
     )
-    )]
-async fn get_v2_health_ready() -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+)]
+async fn kserve_health_ready() -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let data = ReadyResponse { live: true };
     Ok((HeaderMap::new(), Json(data)).into_response())
 }
@@ -1398,12 +1397,12 @@ async fn get_v2_health_ready() -> Result<Response, (StatusCode, Json<ErrorRespon
     tag = "Text Generation Inference",
     path = "/v2",
     responses(
-    (status = 200, description = "Metadata response", body = MetadataServerResponse),
-    (status = 404, description = "No response", body = ErrorResponse,
-    example = json ! ({"error": "No response"})),
+        (status = 200, description = "Metadata retrieved", body = MetadataServerResponse),
+        (status = 404, description = "Service not found", body = ErrorResponse,
+            example = json!({"error": "No response"}))
     )
-    )]
-async fn get_v2() -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+)]
+async fn kerve_server_metadata() -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let data = MetadataServerResponse {
         name: "text-generation-inference".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1422,12 +1421,12 @@ async fn get_v2() -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     tag = "Text Generation Inference",
     path = "/v2/models/{model_name}/versions/{model_version}",
     responses(
-    (status = 200, description = "Model ready response", body = MetadataServerResponse),
-    (status = 404, description = "No response", body = ErrorResponse,
-    example = json ! ({"error": "No response"})),
+        (status = 200, description = "Model version metadata retrieved", body = MetadataServerResponse),
+        (status = 404, description = "Model or version not found", body = ErrorResponse,
+            example = json!({"error": "No response"}))
     )
-    )]
-async fn get_v2_models_model_name_versions_model_version(
+)]
+async fn kserve_model_metadata(
     Path((model_name, model_version)): Path<(String, String)>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let data = MetadataServerResponse {
@@ -1445,12 +1444,12 @@ async fn get_v2_models_model_name_versions_model_version(
     path = "/v2/models/{model_name}/versions/{model_version}/infer",
     request_body = Json<InferenceRequest>,
     responses(
-    (status = 200, description = "Inference response", body = InferenceOutput),
-    (status = 404, description = "No response", body = ErrorResponse,
-    example = json ! ({"error": "No response"})),
+        (status = 200, description = "Inference executed successfully", body = InferenceOutput),
+        (status = 404, description = "Model or version not found", body = ErrorResponse,
+            example = json!({"error": "No response"}))
     )
-    )]
-async fn post_v2_models_model_name_versions_model_version_infer(
+)]
+async fn kserve_model_infer(
     infer: Extension<Infer>,
     Extension(compute_type): Extension<ComputeType>,
     Json(payload): Json<InferenceRequest>,
@@ -1534,12 +1533,12 @@ async fn post_v2_models_model_name_versions_model_version_infer(
     tag = "Text Generation Inference",
     path = "/v2/models/{model_name}/versions/{model_version}/ready",
     responses(
-    (status = 200, description = "Model ready response", body = ReadyResponse),
-    (status = 404, description = "No response", body = ErrorResponse,
-    example = json ! ({"error": "No response"})),
+        (status = 200, description = "Model version is ready", body = ReadyResponse),
+        (status = 404, description = "Model or version not found", body = ErrorResponse,
+            example = json!({"error": "No response"}))
     )
-    )]
-async fn get_v2_models_model_name_versions_model_version_ready(
+)]
+async fn kserve_model_metadata_ready(
     Path((_model_name, _model_version)): Path<(String, String)>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let data = ReadyResponse { live: true };
@@ -1785,12 +1784,12 @@ pub async fn run(
                 #[derive(OpenApi)]
                 #[openapi(
                     paths(
-                        post_v2_models_model_name_versions_model_version_infer,
-                        get_v2_health_live,
-                        get_v2_health_ready,
-                        get_v2,
-                        get_v2_models_model_name_versions_model_version,
-                        get_v2_models_model_name_versions_model_version_ready,
+                        kserve_model_infer,
+                        kserve_health_live,
+                        kserve_health_ready,
+                        kerve_server_metadata,
+                        kserve_model_metadata,
+                        kserve_model_metadata_ready,
                     ),
                     components(schemas(LiveReponse, ReadyResponse, MetadataServerResponse,))
                 )]
@@ -1859,18 +1858,18 @@ pub async fn run(
         app = app
             .route(
                 "/v2/models/:model_name/versions/:model_version/infer",
-                post(post_v2_models_model_name_versions_model_version_infer),
+                post(kserve_model_infer),
             )
             .route(
                 "/v2/models/:model_name/versions/:model_version",
-                get(get_v2_models_model_name_versions_model_version),
+                get(kserve_model_metadata),
             )
-            .route("/v2/health/ready", get(get_v2_health_ready))
-            .route("/v2/health/live", get(get_v2_health_live))
-            .route("/v2", get(get_v2))
+            .route("/v2/health/ready", get(kserve_health_ready))
+            .route("/v2/health/live", get(kserve_health_live))
+            .route("/v2", get(kerve_server_metadata))
             .route(
                 "/v2/models/:model_name/versions/:model_version/ready",
-                get(get_v2_models_model_name_versions_model_version_ready),
+                get(kserve_model_metadata_ready),
             );
     }
 
