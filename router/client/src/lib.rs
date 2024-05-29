@@ -6,10 +6,12 @@ mod pb;
 mod sharded_client;
 
 pub use client::Client;
+pub use pb::generate::v2::input_chunk::Chunk;
 pub use pb::generate::v2::HealthResponse;
 pub use pb::generate::v2::InfoResponse as ShardInfo;
+use pb::generate::v2::InputChunk;
 pub use pb::generate::v2::{
-    Batch, CachedBatch, FinishReason, GeneratedText, Generation, GrammarType,
+    Batch, CachedBatch, FinishReason, GeneratedText, Generation, GrammarType, Input,
     NextTokenChooserParameters, Request, StoppingCriteriaParameters, Tokens,
 };
 pub use sharded_client::ShardedClient;
@@ -44,3 +46,30 @@ impl From<transport::Error> for ClientError {
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
+
+impl From<Vec<Chunk>> for Input {
+    fn from(chunks: Vec<Chunk>) -> Self {
+        Input {
+            chunks: chunks
+                .into_iter()
+                .map(|c| InputChunk { chunk: Some(c) })
+                .collect(),
+        }
+    }
+}
+
+pub trait ChunksToString {
+    /// Convert input chunks to a string for backwards compat.
+    fn chunks_to_string(&self) -> String;
+}
+
+impl ChunksToString for Vec<Chunk> {
+    fn chunks_to_string(&self) -> String {
+        let mut output = String::new();
+        self.iter().for_each(|c| match c {
+            Chunk::Text(text) => output.push_str(text),
+            Chunk::ImageUri(uri) => output.push_str(&format!("![]({})", uri)),
+        });
+        output
+    }
+}

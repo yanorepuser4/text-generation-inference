@@ -51,6 +51,17 @@ message ClearCacheRequest {
 /// Empty response
 message ClearCacheResponse {}
 
+message InputChunk {
+    oneof chunk {
+        string text = 1;
+        string image_uri = 2;
+    }
+}
+
+message Input {
+    repeated InputChunk chunks = 1;
+  }
+
 enum GrammarType {
     GRAMMAR_TYPE_NONE = 0;
     GRAMMAR_TYPE_JSON = 1;
@@ -95,7 +106,9 @@ message StoppingCriteriaParameters {
 message Request {
     /// Request ID
     uint64 id = 1;
-    /// The generation context
+    /// The generation context as chunks
+    Input input_chunks = 8;
+    /// The generation context, stringified input_chunks
     string inputs = 2;
     /// Context truncation
     uint32 truncate = 3;
